@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .filters import FilterConfig, decide_regime_filter, walk_forward_filter_backtest
 from .regime import (
     STATES,
     build_transition_matrix,
@@ -52,6 +53,12 @@ def _fetch_with_retry(ticker: str, years: int) -> pd.DataFrame:
         f"yfinance returned empty data for {ticker} after retry. "
         "Yahoo may be rate-limiting; try again in a few minutes."
     )
+
+
+def _parse_csv(value: str | None, cast=str) -> list:
+    if not value:
+        return []
+    return [cast(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def _close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
@@ -115,6 +122,25 @@ def _print_projection(projection: dict) -> None:
     )
 
 
+def _print_filter_decision(decision: dict) -> None:
+    print("\nRegime filter overlay:")
+    print(f"  Target exposure:              {decision['target_exposure']:.2f}x")
+    print(f"  Mean-reversion longs allowed: {decision['mean_reversion_longs_allowed']}")
+    print(f"  Bull persistence:             {decision['bull_persistence'] * 100:.2f}%")
+    print(f"  Bear persistence:             {decision['bear_persistence'] * 100:.2f}%")
+    if decision["trend_ok"] is not None:
+        print(f"  Trend filter passed:          {decision['trend_ok']}")
+    if decision["vol_percentile"] is not None:
+        print(f"  Volatility percentile:        {decision['vol_percentile']:.2f}")
+    if decision["macro_risk_on"] is not None:
+        print(f"  Macro/risk filter passed:     {decision['macro_risk_on']}")
+    if decision["breadth_percent_above_sma"] is not None:
+        print(f"  Breadth above SMA:            {decision['breadth_percent_above_sma'] * 100:.1f}%")
+    print("  Rules fired:")
+    for reason in decision["reasons"]:
+        print(f"    - {reason}")
+
+
 def _write_report(
     export_dir: Path,
     ticker: str,
@@ -127,6 +153,8 @@ def _write_report(
     stationary: np.ndarray,
     projection: dict,
     backtest: dict,
+    filter_decision: dict | None = None,
+    filter_backtest: dict | None = None,
 ) -> None:
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,11 +164,14 @@ def _write_report(
         {"regime": STATES, "probability": stationary},
     )
     projection_df = pd.DataFrame([projection])
+    filter_df = pd.DataFrame([filter_decision]) if filter_decision else None
 
     transition_df.to_csv(export_dir / "transition_matrix.csv")
     forecast_df.to_csv(export_dir / "forecast_matrix.csv")
     stationary_df.to_csv(export_dir / "stationary_distribution.csv", index=False)
     projection_df.to_csv(export_dir / "next_session_projection.csv", index=False)
+    if filter_df is not None:
+        filter_df.drop(columns=["reasons"], errors="ignore").to_csv(export_dir / "filter_overlay.csv", index=False)
 
     summary = {
         "ticker": ticker,
@@ -150,6 +181,8 @@ def _write_report(
         "forecast_steps": forecast_steps,
         "projection": projection,
         "backtest": backtest,
+        "filter_overlay": filter_decision,
+        "filter_backtest": filter_backtest,
     }
     (export_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -171,6 +204,25 @@ def _write_report(
     max_drawdown = backtest["max_drawdown"]
     sharpe_text = f"{sharpe:.3f}" if np.isfinite(sharpe) else "NaN"
     drawdown_text = f"{max_drawdown * 100:.2f}%" if np.isfinite(max_drawdown) else "NaN"
+    filter_html = ""
+    if filter_decision and filter_backtest:
+        filter_sharpe = filter_backtest["sharpe"]
+        filter_drawdown = filter_backtest["max_drawdown"]
+        filter_sharpe_text = f"{filter_sharpe:.3f}" if np.isfinite(filter_sharpe) else "NaN"
+        filter_drawdown_text = f"{filter_drawdown * 100:.2f}%" if np.isfinite(filter_drawdown) else "NaN"
+        reasons = "".join(f"<li>{reason}</li>" for reason in filter_decision["reasons"])
+        filter_html = f"""
+    <section><h2>Filter Overlay</h2>
+      <table>
+        <tr><th>Target exposure</th><td>{filter_decision["target_exposure"]:.2f}x</td></tr>
+        <tr><th>Mean-reversion longs allowed</th><td>{filter_decision["mean_reversion_longs_allowed"]}</td></tr>
+        <tr><th>Overlay Sharpe</th><td>{filter_sharpe_text}</td></tr>
+        <tr><th>Overlay max drawdown</th><td>{filter_drawdown_text}</td></tr>
+        <tr><th>Average exposure</th><td>{filter_backtest["avg_exposure"]:.2f}x</td></tr>
+      </table>
+      <ul>{reasons}</ul>
+    </section>
+"""
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -189,6 +241,7 @@ def _write_report(
     th {{ background: #f3f6f8; }}
     .callout {{ font-size: 18px; margin: 8px 0 16px; }}
     .score {{ font-weight: 600; }}
+    li {{ margin-bottom: 6px; }}
   </style>
 </head>
 <body>
@@ -210,6 +263,7 @@ def _write_report(
         <tr><th>Trades evaluated</th><td>{backtest["n_trades"]}</td></tr>
       </table>
     </section>
+    {filter_html}
   </div>
 </body>
 </html>
@@ -225,6 +279,77 @@ def _hmm_available() -> bool:
     return True
 
 
+def _fetch_optional_close(ticker: str | None, years: int) -> pd.Series | None:
+    if not ticker:
+        return None
+    df = _fetch_with_retry(ticker, years)
+    return _close_series(df, ticker)
+
+
+def _fetch_breadth_closes(tickers: list[str], years: int) -> dict[str, pd.Series]:
+    closes: dict[str, pd.Series] = {}
+    for ticker in tickers:
+        print(f"  fetching breadth ticker {ticker}...")
+        closes[ticker] = _close_series(_fetch_with_retry(ticker, years), ticker)
+    return closes
+
+
+def _run_grid(args: argparse.Namespace, config: FilterConfig) -> int:
+    tickers = _parse_csv(args.tickers, str) or [args.ticker]
+    windows = _parse_csv(args.windows, int) or [args.window]
+    thresholds = _parse_csv(args.thresholds, float) or [args.threshold]
+    rows: list[dict] = []
+
+    for ticker in tickers:
+        print(f"\nGrid ticker: {ticker}")
+        close = _close_series(_fetch_with_retry(ticker, args.years), ticker)
+        for window in windows:
+            for threshold in thresholds:
+                labels = label_regimes(close, window=window, threshold=threshold)
+                matrix = build_transition_matrix(labels)
+                projection = _current_projection(labels, matrix)
+                filter_decision = decide_regime_filter(close, labels, matrix, config=config)
+                baseline = walk_forward_backtest(close, labels, min_train=args.min_train)
+                filtered = walk_forward_filter_backtest(close, labels, config=config, min_train=args.min_train)
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "window": window,
+                        "threshold": threshold,
+                        "current_regime": projection["current_regime"],
+                        "projected_next_regime": projection["projected_next_regime"],
+                        "projected_probability": projection["projected_probability"],
+                        "target_exposure": filter_decision["target_exposure"],
+                        "baseline_sharpe": baseline["sharpe"],
+                        "baseline_max_drawdown": baseline["max_drawdown"],
+                        "filtered_sharpe": filtered["sharpe"],
+                        "filtered_max_drawdown": filtered["max_drawdown"],
+                        "filtered_avg_exposure": filtered["avg_exposure"],
+                    }
+                )
+
+    results = pd.DataFrame(rows)
+    print("\nWindow/threshold/ticker grid:")
+    display = results.copy()
+    for column in [
+        "projected_probability",
+        "baseline_sharpe",
+        "baseline_max_drawdown",
+        "filtered_sharpe",
+        "filtered_max_drawdown",
+        "filtered_avg_exposure",
+    ]:
+        display[column] = display[column].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NaN")
+    print(display.to_string(index=False))
+
+    if args.export_dir:
+        args.export_dir.mkdir(parents=True, exist_ok=True)
+        results.to_csv(args.export_dir / "grid_results.csv", index=False)
+        print(f"\nGrid results written to: {(args.export_dir / 'grid_results.csv').resolve()}")
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="markov-regime")
     parser.add_argument("--ticker", default="SPY")
@@ -234,8 +359,34 @@ def main() -> int:
     parser.add_argument("--forecast-steps", type=int, default=5)
     parser.add_argument("--min-train", type=int, default=252)
     parser.add_argument("--export-dir", type=Path, help="Write CSV files plus report.html to this folder")
+    parser.add_argument("--no-filters", action="store_true", help="Skip the separate regime filter overlay")
+    parser.add_argument("--bull-persistence-high", type=float, default=0.85)
+    parser.add_argument("--bear-persistence-high", type=float, default=0.80)
+    parser.add_argument("--trend-window", type=int, default=200)
+    parser.add_argument("--vol-window", type=int, default=20)
+    parser.add_argument("--vol-high-percentile", type=float, default=0.80)
+    parser.add_argument("--macro-ticker", help="Optional risk/macro ticker such as ^VIX; above SMA reduces exposure")
+    parser.add_argument("--macro-window", type=int, default=50)
+    parser.add_argument("--breadth-tickers", help="Comma-separated breadth tickers; percent above SMA drives breadth filter")
+    parser.add_argument("--breadth-window", type=int, default=50)
+    parser.add_argument("--grid", action="store_true", help="Test ticker/window/threshold combinations")
+    parser.add_argument("--tickers", help="Comma-separated ticker list for --grid")
+    parser.add_argument("--windows", help="Comma-separated rolling-return windows for --grid")
+    parser.add_argument("--thresholds", help="Comma-separated regime thresholds for --grid")
     parser.add_argument("--no-hmm", action="store_true")
     args = parser.parse_args()
+    config = FilterConfig(
+        bull_persistence_high=args.bull_persistence_high,
+        bear_persistence_high=args.bear_persistence_high,
+        trend_window=args.trend_window,
+        vol_window=args.vol_window,
+        vol_high_percentile=args.vol_high_percentile,
+        macro_window=args.macro_window,
+        breadth_window=args.breadth_window,
+    )
+
+    if args.grid:
+        return _run_grid(args, config)
 
     print(
         "\nmarkov-regime "
@@ -251,8 +402,27 @@ def main() -> int:
     matrix = build_transition_matrix(labels)
     stationary = stationary_distribution(matrix)
     projection = _current_projection(labels, matrix)
+    macro_close = None
+    breadth_closes: dict[str, pd.Series] = {}
+    if not args.no_filters and args.macro_ticker:
+        print(f"  fetching macro/risk ticker {args.macro_ticker}...")
+        macro_close = _fetch_optional_close(args.macro_ticker, args.years)
+    if not args.no_filters and args.breadth_tickers:
+        breadth_closes = _fetch_breadth_closes(_parse_csv(args.breadth_tickers, str), args.years)
 
     _print_projection(projection)
+    filter_decision = None
+    filter_result = None
+    if not args.no_filters:
+        filter_decision = decide_regime_filter(
+            close=close,
+            labels=labels,
+            matrix=matrix,
+            config=config,
+            macro_close=macro_close,
+            breadth_closes=breadth_closes,
+        )
+        _print_filter_decision(filter_decision)
 
     _print_matrix("Transition matrix (rows = from, cols = to):", matrix)
 
@@ -280,6 +450,28 @@ def main() -> int:
     else:
         print("  Max drawdown: NaN")
     print(f"  Trades evaluated: {result['n_trades']}")
+    if not args.no_filters:
+        print("\nFilter-overlay backtest (long-only exposure sizing, no lookahead)...")
+        filter_result = walk_forward_filter_backtest(
+            close=close,
+            labels=labels,
+            config=config,
+            min_train=args.min_train,
+            macro_close=macro_close,
+            breadth_closes=breadth_closes,
+        )
+        filter_sharpe = filter_result["sharpe"]
+        filter_mdd = filter_result["max_drawdown"]
+        if np.isfinite(filter_sharpe):
+            print(f"  Sharpe (annualized, filter overlay): {filter_sharpe:.3f}")
+        else:
+            print("  Sharpe: NaN (insufficient data or zero return volatility)")
+        if np.isfinite(filter_mdd):
+            print(f"  Max drawdown:                         {filter_mdd * 100:.2f}%")
+        else:
+            print("  Max drawdown: NaN")
+        print(f"  Average exposure:                     {filter_result['avg_exposure']:.2f}x")
+        print(f"  Trades evaluated:                     {filter_result['n_trades']}")
 
     if args.export_dir:
         _write_report(
@@ -294,6 +486,8 @@ def main() -> int:
             stationary=stationary,
             projection=projection,
             backtest=result,
+            filter_decision=filter_decision,
+            filter_backtest=filter_result,
         )
         print(f"\nReport files written to: {args.export_dir.resolve()}")
         print(f"Open this file to view the results: {(args.export_dir / 'report.html').resolve()}")
