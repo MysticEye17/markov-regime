@@ -111,4 +111,4 @@ Use `--export-dir` to write CSV files, `summary.json`, and `report.html`.
 
 ## Notes
 
-This is research tooling, not financial advice. Backtests are historical and not forward-looking.
+This is research tooling, not financial advice.
